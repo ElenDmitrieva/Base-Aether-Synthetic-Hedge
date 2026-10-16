@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract AetherSyntheticHedge {
+    enum PolicyStatus { Active, Settled, Terminated }
+
+    struct HedgePolicy {
+        address payable policyHolder;
+        uint256 insuredCollateral;
+        uint256 hedgeCapacity;
+        uint256 premiumPaid;
+        uint256 expiresAt;
+        PolicyStatus status;
+        bytes32 underlyingAssetKey;
+    }
+
+    address payable public immutable hedgeGovernor;
+    string public hedgeDescriptor;
+    uint256 public basePremiumRateBps; // 200 = 2%
+    uint256 public policyCounter;
+    uint256 public totalUnderwrittenRisk;
+    uint256 public accumulatedHedgePremiums;
+    bool public isHedgePaused;
+
+    mapping(uint256 => HedgePolicy) public policies;
+    mapping(bytes32 => bool) public approvedAssetKeys;
+
+    event AssetKeyStatusSet(bytes32 indexed assetKey, bool status);
+    event UnderwritingPoolFunded(address indexed funder, uint256 amount);
+    event PolicyUnderwritten(uint256 indexed policyId, address indexed holder, bytes32 indexed assetKey, uint256 insuredAmount);
+    event PolicyCollateralTopUp(uint256 indexed policyId, uint256 addedAmount);
+    event PolicyExtended(uint256 indexed policyId, uint256 newExpiration);
+    event HedgeClaimSettled(uint256 indexed policyId, uint256 payoutAmount);
+    event PolicyPrematurelyTerminated(uint256 indexed policyId, uint256 returnedCollateral);
+    event PremiumRateModified(uint256 newRateBps);
+    event HedgeDescriptorSet(string newDescriptor);
+    event PauseStateToggled(bool isPaused);
+    event PremiumsSwept(address indexed recipient, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == hedgeGovernor, "Hedge: Not governor");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isHedgePaused, "Hedge: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        hedgeGovernor = payable(msg.sender);
+        hedgeDescriptor = "Aether Base Synthetic Hedge Protocol v1";
+        basePremiumRateBps = 200; // 2%
+        isHedgePaused = false;
+    }
+
+    // 1. Включение/выключение поддерживаемого ключа актива
+    function setApprovedAssetKey(bytes32 assetKey, bool isApproved) external onlyGovernor {
+        approvedAssetKeys[assetKey] = isApproved;
+        emit AssetKeyStatusSet(assetKey, isApproved);
+    }
+
+    // 2. Пополнение страхового пула ликвидности
+    function fundUnderwritingPool() external payable onlyGovernor {
+        require(msg.value > 0, "Hedge: Zero deposit");
+        emit UnderwritingPoolFunded(msg.sender, msg.value);
+    }
+
+    // 3. Открытие хедж-полиса (депозит залога + премия)
+    function openHedgePolicy(
+        bytes32 assetKey,
+        uint256 durationSeconds
+    ) external payable whenNotPaused returns (uint256) {
+        require(approvedAssetKeys[assetKey], "Hedge: Unsupported asset key");
+        require(msg.value > 0, "Hedge: Zero value");
+        require(durationSeconds >= 60, "Hedge: Min duration 60s");
+
+        uint256 premium = (msg.value * basePremiumRateBps) / 10000;
+        uint256 netCollateral = msg.value - premium;
+        accumulatedHedgePremiums += premium;
+
+        policyCounter++;
+        policies[policyCounter] = HedgePolicy({
+            policyHolder: payable(msg.sender),
+            insuredCollateral: netCollateral,
+            hedgeCapacity: netCollateral * 2,
+            premiumPaid: premium,
+            expiresAt: block.timestamp + durationSeconds,
+            status: PolicyStatus.Active,
+            underlyingAssetKey: assetKey
+        });
+
+        totalUnderwrittenRisk += netCollateral;
+        emit PolicyUnderwritten(policyCounter, msg.sender, assetKey, netCollateral);
+        return policyCounter;
+    }
+
+    // 4. Дозаправка залога действующего полиса
+    function topUpPolicyCollateral(uint256 policyId) external payable whenNotPaused {
+        HedgePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Hedge: Invalid policy ID");
+        require(p.status == PolicyStatus.Active, "Hedge: Not active");
+        require(msg.value > 0, "Hedge: Zero top up");
+
+        p.insuredCollateral += msg.value;
+        p.hedgeCapacity += msg.value * 2;
+        totalUnderwrittenRisk += msg.value;
+
+        emit PolicyCollateralTopUp(policyId, msg.value);
+    }
+
+    // 5. Продление срока действия хеджа
+    function extendPolicyDuration(uint256 policyId, uint256 extraSeconds) external whenNotPaused {
+        HedgePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Hedge: Invalid ID");
+        require(p.policyHolder == msg.sender, "Hedge: Not holder");
+        require(p.status == PolicyStatus.Active, "Hedge: Not active");
+        require(extraSeconds > 0, "Hedge: Zero extra seconds");
+
+        p.expiresAt += extraSeconds;
+        emit PolicyExtended(policyId, p.expiresAt);
+    }
+
+    // 6. Страховое урегулирование / выплата компенсации
+    function settleHedgeClaim(uint256 policyId, uint256 payoutAmount) external onlyGovernor {
+        HedgePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Hedge: Invalid ID");
+        require(p.status == PolicyStatus.Active, "Hedge: Not active");
+        require(payoutAmount <= p.insuredCollateral, "Hedge: Payout exceeds collateral");
+        require(address(this).balance >= payoutAmount, "Hedge: Pool lack of funds");
+
+        p.status = PolicyStatus.Settled;
+        p.insuredCollateral -= payoutAmount;
+        totalUnderwrittenRisk -= payoutAmount;
+
+        (bool sent, ) = p.policyHolder.call{value: payoutAmount}("");
+        require(sent, "Hedge: Payout failed");
+
+        emit HedgeClaimSettled(policyId, payoutAmount);
+    }
+
+    // 7. Досрочное закрытие полиса с возвратом остатка залога
+    function terminatePolicyEarly(uint256 policyId) external {
+        HedgePolicy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "Hedge: Invalid ID");
+        require(p.policyHolder == msg.sender, "Hedge: Not holder");
+        require(p.status == PolicyStatus.Active, "Hedge: Not active");
+
+        p.status = PolicyStatus.Terminated;
+        uint256 refund = p.insuredCollateral;
+        p.insuredCollateral = 0;
+        totalUnderwrittenRisk -= refund;
+
+        (bool sent, ) = p.policyHolder.call{value: refund}("");
+        require(sent, "Hedge: Refund failed");
+
+        emit PolicyPrematurelyTerminated(policyId, refund);
+    }
+
+    // 8. Регулировка базовой ставки страховой премии
+    function adjustPremiumRate(uint256 newRateBps) external onlyGovernor {
+        require(newRateBps <= 1000, "Hedge: Max premium 10%");
+        basePremiumRateBps = newRateBps;
+        emit PremiumRateModified(newRateBps);
+    }
+
+    // 9. Смена дескриптора хедж-протокола
+    function setHedgeDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "Hedge: Empty descriptor");
+        hedgeDescriptor = newDescriptor;
+        emit HedgeDescriptorSet(newDescriptor);
+    }
+
+    // 10. Аварийная пауза протокола
+    function togglePause(bool paused) external onlyGovernor {
+        isHedgePaused = paused;
+        emit PauseStateToggled(paused);
+    }
+
+    // 11. Вывод накопленных страховых премий
+    function sweepPremiums() external onlyGovernor {
+        uint256 fees = accumulatedHedgePremiums;
+        require(fees > 0, "Hedge: Zero fees");
+
+        accumulatedHedgePremiums = 0;
+        (bool sent, ) = hedgeGovernor.call{value: fees}("");
+        require(sent, "Hedge: Sweep failed");
+
+        emit PremiumsSwept(hedgeGovernor, fees);
+    }
+
+    // Read-функция
+    function getPolicyDetails(uint256 policyId) external view returns (
+        address holder,
+        uint256 collateral,
+        uint256 capacity,
+        uint256 expiresAt,
+        PolicyStatus status
+    ) {
+        HedgePolicy memory p = policies[policyId];
+        return (p.policyHolder, p.insuredCollateral, p.hedgeCapacity, p.expiresAt, p.status);
+    }
+}
